@@ -13,8 +13,21 @@ class NUPLCalculator:
 
     def download_data(self, start="2020-01-01"):
         end = datetime.today().strftime("%Y-%m-%d")
-        df = yf.download(self.ticker, start=start, end=end, interval="1d")
-        df = df[["Close"]].rename(columns={"Close": "price"})
+        # Fetch extra history before `start` to warm up the rolling window
+        warmup_start = (
+            pd.to_datetime(start) - pd.DateOffset(days=self.window * 2)
+        ).strftime("%Y-%m-%d")
+        self._requested_start = pd.to_datetime(start).date()
+        raw = yf.download(
+            self.ticker, start=warmup_start, end=end, interval="1d", progress=False
+        )
+        if raw.empty:
+            raise ValueError(f"No data returned by yfinance for ticker '{self.ticker}'")
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        # squeeze() ensures we get a Series, not a single-column DataFrame
+        close = raw[["Close"]].squeeze()
+        df = close.to_frame("price")
         df.index.name = "date"
         df.reset_index(inplace=True)
         self.data = df
@@ -22,11 +35,19 @@ class NUPLCalculator:
     def calculate_nupl(self):
         df = self.data.copy()
         df["supply"] = self.supply
+        df["price"] = df["price"].squeeze()  # ensure Series, not DataFrame
         df["realized_price"] = df["price"].rolling(window=self.window).mean()
         df["market_cap"] = df["price"] * df["supply"]
         df["realized_cap"] = df["realized_price"] * df["supply"]
         df["nupl"] = (df["market_cap"] - df["realized_cap"]) / df["market_cap"]
-        self.data = df.dropna()
+        result = df.dropna()
+        # Trim warmup rows — keep only data from the originally requested start date
+        result = result[result["date"].dt.date >= self._requested_start]
+        if result.empty:
+            raise ValueError(
+                f"No data available from {self._requested_start} for ticker '{self.ticker}'."
+            )
+        self.data = result
 
     def interpret_latest(self):
         latest = self.data.iloc[-1]
